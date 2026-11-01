@@ -272,9 +272,8 @@ impl Router {
     /// the headers and body. Priorities default to zero and constraints default
     /// to empty when absent. Supports `/v1/chat/completions`, `/v1/completions`
     /// and `/v1/responses` bodies. The API is chosen by the `:path`
-    /// pseudo-header; when that names no known route, the body is
-    /// discriminated by a non-empty `messages` array (chat) versus a `prompt`
-    /// (completions).
+    /// pseudo-header; when that names no known route, by the body's shape (see
+    /// [`request_api_from_body`]).
     async fn tokenize(
         &self,
         request_json: &str,
@@ -291,7 +290,7 @@ impl Router {
                 return self.tokenize_completion(request, headers).await;
             }
             Some(RequestApi::Responses) => {
-                let request = responses_to_chat_request(request_json)?;
+                let request = responses_to_chat_request(serde_json::from_str(request_json)?)?;
                 return self.tokenize_chat(&request, headers);
             }
             None => {}
@@ -316,17 +315,21 @@ impl Router {
         // The `:path` dispatch above avoids this scan entirely; it remains only
         // for requests whose path names no known route.
         let value: serde_json::Value = serde_json::from_str(request_json)?;
-        let has_messages = value
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .is_some_and(|messages| !messages.is_empty());
-        if !has_messages && value.get("prompt").is_some() {
-            let request: NvCreateCompletionRequest = serde_json::from_value(value)?;
-            return self.tokenize_completion(request, headers).await;
+        match request_api_from_body(&value) {
+            RequestApi::ChatCompletions => {
+                let request: dynamo_llm::types::openai::chat_completions::NvCreateChatCompletionRequest =
+                    serde_json::from_value(value)?;
+                self.tokenize_chat(&request, headers)
+            }
+            RequestApi::Completions => {
+                let request: NvCreateCompletionRequest = serde_json::from_value(value)?;
+                self.tokenize_completion(request, headers).await
+            }
+            RequestApi::Responses => {
+                let request = responses_to_chat_request(serde_json::from_value(value)?)?;
+                self.tokenize_chat(&request, headers)
+            }
         }
-        let request: dynamo_llm::types::openai::chat_completions::NvCreateChatCompletionRequest =
-            serde_json::from_value(value)?;
-        self.tokenize_chat(&request, headers)
     }
 
     /// Tokenize a `/v1/chat/completions` body via the chat template.
@@ -781,13 +784,31 @@ fn request_api_from_path(headers: &[(String, String)]) -> Option<RequestApi> {
     }
 }
 
+/// The API a body is shaped for, used when the path names no known route: a
+/// non-empty `messages` array is chat, a `prompt` is completions, an `input`
+/// is Responses, anything else is chat.
+fn request_api_from_body(value: &serde_json::Value) -> RequestApi {
+    let has_messages = value
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|messages| !messages.is_empty());
+    if has_messages {
+        RequestApi::ChatCompletions
+    } else if value.get("prompt").is_some() {
+        RequestApi::Completions
+    } else if value.get("input").is_some() {
+        RequestApi::Responses
+    } else {
+        RequestApi::ChatCompletions
+    }
+}
+
 /// Convert a `/v1/responses` body to the chat request the Frontend renders
 /// for it: the same `NvCreateResponse` -> chat conversion, then the same
 /// reasoning-control normalization, so the chat template sees identical input.
 fn responses_to_chat_request(
-    request_json: &str,
+    request: NvCreateResponse,
 ) -> Result<dynamo_llm::types::openai::chat_completions::NvCreateChatCompletionRequest> {
-    let request: NvCreateResponse = serde_json::from_str(request_json)?;
     let mut chat_request =
         dynamo_llm::types::openai::chat_completions::NvCreateChatCompletionRequest::try_from(
             request,
@@ -2056,6 +2077,35 @@ mod tests {
         assert_eq!(request_api_from_path(&[]), None);
     }
 
+    /// A gateway that does not forward `:path` leaves the API to the body, so
+    /// a Responses body must still be recognized there.
+    #[test]
+    fn request_api_chosen_by_body_without_path() {
+        let api = |body: serde_json::Value| request_api_from_body(&body);
+        assert_eq!(
+            api(serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]})),
+            RequestApi::ChatCompletions
+        );
+        assert_eq!(
+            api(serde_json::json!({"model": "m", "prompt": "hi"})),
+            RequestApi::Completions
+        );
+        assert_eq!(
+            api(serde_json::json!({"model": "m", "input": "hi", "instructions": "be brief"})),
+            RequestApi::Responses
+        );
+        assert_eq!(
+            api(
+                serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "input": "hi"})
+            ),
+            RequestApi::ChatCompletions
+        );
+        assert_eq!(
+            api(serde_json::json!({"model": "m"})),
+            RequestApi::ChatCompletions
+        );
+    }
+
     /// A `/v1/responses` body has `input`, not `messages` or `prompt`, so it
     /// does not parse as chat. Routed by path, it is converted the way the
     /// Frontend converts it, and its chat-template tokens match those of the
@@ -2100,8 +2150,9 @@ mod tests {
                 "a Responses body must not parse as chat"
             );
 
-            let responses_tokens =
-                template_tokens(&responses_to_chat_request(&responses_body).unwrap());
+            let responses_tokens = template_tokens(
+                &responses_to_chat_request(serde_json::from_str(&responses_body).unwrap()).unwrap(),
+            );
 
             let chat_request: dynamo_llm::types::openai::chat_completions::NvCreateChatCompletionRequest =
                 serde_json::from_value(serde_json::json!({
